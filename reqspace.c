@@ -1,129 +1,222 @@
-#include<unistd.h>
-#include<stddef.h>
-#include<stdio.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#define NUM_BINS 8
 typedef struct block_header {
   size_t size;
   int isfree;
- struct block_header *next;
+  struct block_header *next;
   struct block_header *prev;
-}block_header_t;
-static block_header_t *freelist = NULL;
-static block_header_t *lastblock=NULL;
-block_header_t *reqestspace(block_header_t* last,size_t size){
-  block_header_t* block=sbrk(0);
-  void *request = sbrk(sizeof(block_header_t)+size);
-  if(request == (void*)-1)return NULL;
+  struct block_header *bin_next;
+  struct block_header *bin_prev;
+} block_header_t;
 
-  block->size=size;
-  block->isfree=0;
-  block->prev=last;
-  block->next=NULL;
-  if(last){
-    last->next=block;
-  }
-  lastblock=block;
-   return block;
+static block_header_t *bins[NUM_BINS];
+
+int bin_index(size_t size) {
+  if (size <= 8)
+    return 0;
+  int index = __builtin_clz(size - 1) - 2;
+  if (index >= NUM_BINS)
+    return NUM_BINS - 1;
+  return index;
 }
 
-void splitblocks(block_header_t *block,size_t size){
-  block_header_t *leftover=(block_header_t*)((char*)(block+1)+size);
-  leftover->size=block->size-size-sizeof(block_header_t);
-  leftover->isfree=1;
-  leftover->next=block->next;
-  leftover->prev=block;
-  if(block->next){
-    block->next->prev=leftover;
-  }
-  block->next=leftover;
-  block->size=size;
-  if(block==lastblock) lastblock=leftover;
+void bin_insert(block_header_t *block) {
+  int index = bin_index(block->size);
+  block->bin_prev = NULL;
+  block->bin_next = bins[index];
+  if (bins[index])
+    bins[index]->bin_prev = block;
+  bins[index] = block;
 }
 
-void coalesce(block_header_t *block){
-  //next is free
-  if(block->next && block->isfree && block->next->isfree && ((char*)(block+1)+block->size==(char*)block->next)){
-    if(block->next==lastblock)lastblock=block;
-    block->size=block->size+sizeof(block_header_t)+block->next->size;
-    block->next=block->next->next;
-    if(block->next)block->next->prev=block;
+void bin_remove(block_header_t *block) {
+  int index = bin_index(block->size);
+  if (block->bin_prev)
+    block->bin_prev->bin_next = block->bin_next;
+  else
+    bins[index] = block->bin_next;
+  if (block->bin_next) {
+    block->bin_next->bin_prev = block->bin_prev;
   }
-  //prev is free 
-  if(block->prev && block->isfree &&block->prev->isfree &&(char*)(block->prev+1)+block->prev->size==(char*)block){
-     if(block==lastblock)lastblock=block->prev;
-    block->prev->size=block->prev->size + sizeof(block_header_t)+block->size;
-    block->prev->next=block->next;
-    if(block->next){
-      block->next->prev=block->prev;
+  block->bin_next = NULL;
+  block->bin_prev = NULL;
+}
+
+static block_header_t *lastblock = NULL;
+
+block_header_t *reqestspace(block_header_t *last, size_t size) {
+  block_header_t *block = sbrk(0);
+  void *request = sbrk(sizeof(block_header_t) + size);
+  if (request == (void *)-1)
+    return NULL;
+
+  block->size = size;
+  block->isfree = 0;
+  block->prev = last;
+  block->next = NULL;
+  block->bin_next = NULL;
+  block->bin_prev = NULL;
+  if (last) {
+    last->next = block;
+  }
+  lastblock = block;
+  return block;
+}
+
+void splitblocks(block_header_t *block, size_t size) {
+  block_header_t *leftover = (block_header_t *)((char *)(block + 1) + size);
+  leftover->size = block->size - size - sizeof(block_header_t);
+  leftover->isfree = 1;
+  leftover->next = block->next;
+  leftover->prev = block;
+  if (block->next) {
+    block->next->prev = leftover;
+  }
+  block->next = leftover;
+  block->size = size;
+  bin_insert(leftover);
+  if (block == lastblock)
+    lastblock = leftover;
+}
+
+void coalesce(block_header_t *block) {
+  // next is free
+  if (block->next && block->isfree && block->next->isfree &&
+      ((char *)(block + 1) + block->size == (char *)block->next)) {
+    bin_remove(block->next);
+    bin_remove(block);
+    if (block->next == lastblock)
+      lastblock = block;
+    block->size = block->size + sizeof(block_header_t) + block->next->size;
+    block->next = block->next->next;
+    if (block->next)
+      block->next->prev = block;
+    bin_insert(block);
+  }
+  // prev is free
+  if (block->prev && block->isfree && block->prev->isfree &&
+      (char *)(block->prev + 1) + block->prev->size == (char *)block) {
+    bin_remove(block->prev);
+    bin_remove(block);
+    if (block == lastblock)
+      lastblock = block->prev;
+    block->prev->size =
+        block->prev->size + sizeof(block_header_t) + block->size;
+    block->prev->next = block->next;
+    if (block->next) {
+      block->next->prev = block->prev;
     }
-     }
+    bin_insert(block->prev);
+  }
 }
 
-block_header_t *find_free_block(size_t size){
-  block_header_t *curr=freelist;
-  while(curr){
-    // printf("checking block -isfree:%d  size:%zu\n",curr->isfree,curr->size);
-    if(curr->isfree &&curr->size>=size){
-      return curr;
+block_header_t *find_free_block(size_t size) {
+  int index = bin_index(size);
+  while (index < NUM_BINS) {
+    block_header_t *block = bins[index];
+    while (block) {
+      if (block->size >= size)
+        return block;
+      block = block->bin_next;
     }
-      curr=curr->next;
+    index++;
   }
   return NULL;
 }
 
-void *mymalloc(size_t size){
-  if(size==0)return NULL;
-  
-  block_header_t *block=find_free_block(size);
-  if(block){
-    if(block->size>=size+sizeof(block_header_t)+1){
-      splitblocks(block,size);
-    }
-   block->isfree=0; 
-  }else{
-  block= reqestspace(lastblock,size);
-  if(!block)return NULL;
-  if(!freelist)freelist=block;
-  }
+void *mymalloc(size_t size) {
+  if (size == 0)
+    return NULL;
 
-  return (void*)(block+1);
+  block_header_t *block = find_free_block(size);
+  
+  if (block) {
+    bin_remove(block);
+    if (block->size >= size + sizeof(block_header_t) + 1) {
+      splitblocks(block, size);
+    }
+    block->isfree = 0;
+  } else {
+    block = reqestspace(lastblock, size);
+    if (!block)
+      return NULL;
+  }
+  return (void *)(block + 1);
 }
 
-void myfree(void *ptr){
-  if(!ptr)return;
-  block_header_t *block=(block_header_t*)ptr-1;
-  block->isfree=1;
+void myfree(void *ptr) {
+  if (!ptr)
+    return;
+  block_header_t *block = (block_header_t *)ptr - 1;
+  block->isfree = 1;
+  bin_insert(block);
   coalesce(block);
 }
 
-int main(){
-
-  //coalesce 
-  char* a= (char*)mymalloc(10);
-  char* b=(char*)mymalloc(10);
- 
-
+int main() {
+  
+  //bins 
+  int *a=(int*)mymalloc(8);
   myfree(a);
-  myfree(b);
- 
-  char* d=(char*)mymalloc(20);
-  printf("address of a:%p\n",(void*)a);
-  printf("address of d:%p\n",(void*)d);
-  printf("both are same though coalescing works:%s\n",(void*)a==(void*)d?"Yes":"no");
+  int *b=(int*)mymalloc(8);
+  printf("reuse same bin a==b:%s\n",a==b?"yes":"no");
 
-  //splitting  
-  // char* a=(char*)mymalloc(100);
+  char* x=(char*)mymalloc(16);
+  char* y=(char*)mymalloc(16);
+  myfree(x);
+  myfree(y);
+  char* z=(char*)mymalloc(32);
+  printf("coalesce x and y though addresses are same x==z:%s\n",(void*)x==(void*)z?"yes":"no");
+
+  char* large=(char*)mymalloc(64);
+  myfree(large);
+  char* sm1=(char*)mymalloc(8);
+  char* sm2=(char*)mymalloc(8);
+block_header_t *h1 = (block_header_t *)sm1 - 1;
+block_header_t *h2 = (block_header_t *)sm2 - 1;
+printf("small1 block size: %zu\n", h1->size);
+printf("small2 block size: %zu\n", h2->size);
+printf("actual gap: %ld\n", (char *)sm2 - (char *)sm1);
+printf("expected gap: %zu\n", 8 + sizeof(block_header_t));
+  printf("split large with sm1 and sm2 i.e sm1==large:%s\n",(void*)large==(void*)sm1?"yes":"no");
+  printf("sm2->data is sm1 + sizeof(header) i.e sm2-sm1=8+sizeof(header):%s\n",(char*)sm2-(char*)sm1==8+sizeof(block_header_t)?"yes":"no");
+
+void* n=mymalloc(0);//null on 0 size test 
+printf("when size is 0 we get NULL:%s\n",n==NULL?"yes":"no");
+
+
+
+
+  // coalesce
+  // char *a = (char *)mymalloc(10);
+  // char *b = (char *)mymalloc(10);
+  //
   // myfree(a);
+  // myfree(b);
   //
-  // char* b=(char*)mymalloc(10);
-  // char* c=(char*)mymalloc(10);
-  //
-  // printf("a at %p\n",(void*)a);
-  // printf("b at %p\n",(void*)b);
-  // printf("c at %p\n",(void*)c);
-  //
-  // printf("gap between b and c:%ld\n",(char*)c-(char*)b);
+  // char *d = (char *)mymalloc(20);
+  // printf("address of a:%p\n", (void *)a);
+  // printf("address of d:%p\n", (void *)d);
+  // printf("both are same though coalescing works:%s\n",
+  //        (void *)a == (void *)d ? "Yes" : "no");
 
-  // find free block 
+  // splitting
+  //  char* a=(char*)mymalloc(100);
+  //  myfree(a);
+  //
+  //  char* b=(char*)mymalloc(10);
+  //  char* c=(char*)mymalloc(10);
+  //
+  //  printf("a at %p\n",(void*)a);
+  //  printf("b at %p\n",(void*)b);
+  //  printf("c at %p\n",(void*)c);
+  //
+  //  printf("gap between b and c:%ld\n",(char*)c-(char*)b);
+
+  // find free block
   // int* a=(int*)mymalloc(sizeof(int));
   // *a=100;
   // printf("a is at : %p\n",(void*)a);
@@ -140,5 +233,5 @@ int main(){
   // printf("a and b share same address:%s\n",a==b?"yes":"no");
   // printf("b and c are on same address:%s\n",b==c?"yes":"no");
   // printf("gap between b and c:%ld\n",(char*)c-(char*)b);
-   return 0;
+  return 0;
 }
