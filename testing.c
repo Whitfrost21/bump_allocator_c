@@ -1,3 +1,7 @@
+//this is basic implementation which gives me the idea of how the malloc works,
+//this is a simple program which uses a header with doubly linked list to allocate and free memory
+//I extended this code in the main malloc.c , although this code does not cover
+//all the basic things but gives us an idea of what's going on and how pointer's work.
 #include<unistd.h>
 #include<stddef.h>
 #include<stdio.h>
