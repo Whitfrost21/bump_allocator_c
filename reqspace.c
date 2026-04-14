@@ -134,7 +134,7 @@ void *mymalloc(size_t size) {
   block_header_t *block = find_free_block(size);
   
   if (block) {
-    bin_remove(block);
+    bin_remove(block);//remove block before splitting to avoid bin confusions
     if (block->size >= size + sizeof(block_header_t) + 1) {
       splitblocks(block, size);
     }
