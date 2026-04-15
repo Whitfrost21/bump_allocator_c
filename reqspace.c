@@ -1,7 +1,7 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <unistd.h>
-
+#include <pthread.h>
 #define NUM_BINS 8
 typedef struct block_header {
   size_t size;
@@ -14,6 +14,7 @@ typedef struct block_header {
 
 static block_header_t *bins[NUM_BINS];
 
+pthread_mutex_t globallock=PTHREAD_MUTEX_INITIALIZER;
 int bin_index(size_t size) {
   if (size <= 8)
     return 0;
@@ -83,20 +84,7 @@ void splitblocks(block_header_t *block, size_t size) {
 }
 
 void coalesce(block_header_t *block) {
-  // next is free
-  if (block->next && block->isfree && block->next->isfree &&
-      ((char *)(block + 1) + block->size == (char *)block->next)) {
-    bin_remove(block->next);
-    bin_remove(block);
-    if (block->next == lastblock)
-      lastblock = block;
-    block->size = block->size + sizeof(block_header_t) + block->next->size;
-    block->next = block->next->next;
-    if (block->next)
-      block->next->prev = block;
-    bin_insert(block);
-  }
-  // prev is free
+   // prev is free
   if (block->prev && block->isfree && block->prev->isfree &&
       (char *)(block->prev + 1) + block->prev->size == (char *)block) {
     bin_remove(block->prev);
@@ -111,6 +99,20 @@ void coalesce(block_header_t *block) {
     }
     bin_insert(block->prev);
   }
+  // next is free
+  if (block->next && block->isfree && block->next->isfree &&
+      ((char *)(block + 1) + block->size == (char *)block->next)) {
+    bin_remove(block->next);
+    bin_remove(block);
+    if (block->next == lastblock)
+      lastblock = block;
+    block->size = block->size + sizeof(block_header_t) + block->next->size;
+    block->next = block->next->next;
+    if (block->next)
+      block->next->prev = block;
+    bin_insert(block);
+  }
+ 
 }
 
 block_header_t *find_free_block(size_t size) {
@@ -130,7 +132,7 @@ block_header_t *find_free_block(size_t size) {
 void *mymalloc(size_t size) {
   if (size == 0)
     return NULL;
-
+  pthread_mutex_lock(&globallock);
   block_header_t *block = find_free_block(size);
   
   if (block) {
@@ -141,19 +143,24 @@ void *mymalloc(size_t size) {
     block->isfree = 0;
   } else {
     block = reqestspace(lastblock, size);
-    if (!block)
-      return NULL;
+    if (!block){pthread_mutex_unlock(&globallock);
+      return NULL;}
   }
+  pthread_mutex_unlock(&globallock);
   return (void *)(block + 1);
 }
 
 void myfree(void *ptr) {
-  if (!ptr)
+    if (!ptr){ 
     return;
+  }
+  pthread_mutex_lock(&globallock);
+
   block_header_t *block = (block_header_t *)ptr - 1;
   block->isfree = 1;
   bin_insert(block);
   coalesce(block);
+  pthread_mutex_unlock(&globallock);
 }
 
 int main() {
