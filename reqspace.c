@@ -1,8 +1,11 @@
-#include <stddef.h>
-#include <stdio.h>
-#include <unistd.h>
 #include <pthread.h>
+#include <stddef.h>
+#include<stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #define NUM_BINS 8
+#define ALIGN(size) (((size)+7)& ~7)
 typedef struct block_header {
   size_t size;
   int isfree;
@@ -14,11 +17,11 @@ typedef struct block_header {
 
 static block_header_t *bins[NUM_BINS];
 
-pthread_mutex_t globallock=PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t globallock = PTHREAD_MUTEX_INITIALIZER;
 int bin_index(size_t size) {
   if (size <= 8)
     return 0;
-  int index = __builtin_clz(size - 1) - 2;
+  int index = 31 - __builtin_clz(size - 1) - 2;
   if (index >= NUM_BINS)
     return NUM_BINS - 1;
   return index;
@@ -84,7 +87,7 @@ void splitblocks(block_header_t *block, size_t size) {
 }
 
 void coalesce(block_header_t *block) {
-   // prev is free
+  // prev is free
   if (block->prev && block->isfree && block->prev->isfree &&
       (char *)(block->prev + 1) + block->prev->size == (char *)block) {
     bin_remove(block->prev);
@@ -112,7 +115,6 @@ void coalesce(block_header_t *block) {
       block->next->prev = block;
     bin_insert(block);
   }
- 
 }
 
 block_header_t *find_free_block(size_t size) {
@@ -132,26 +134,29 @@ block_header_t *find_free_block(size_t size) {
 void *mymalloc(size_t size) {
   if (size == 0)
     return NULL;
+  size = ALIGN(size);
   pthread_mutex_lock(&globallock);
   block_header_t *block = find_free_block(size);
-  
+
   if (block) {
-    bin_remove(block);//remove block before splitting to avoid bin confusions
+    bin_remove(block); // remove block before splitting to avoid bin confusions
     if (block->size >= size + sizeof(block_header_t) + 1) {
       splitblocks(block, size);
     }
     block->isfree = 0;
   } else {
     block = reqestspace(lastblock, size);
-    if (!block){pthread_mutex_unlock(&globallock);
-      return NULL;}
+    if (!block) {
+      pthread_mutex_unlock(&globallock);
+      return NULL;
+    }
   }
   pthread_mutex_unlock(&globallock);
   return (void *)(block + 1);
 }
 
 void myfree(void *ptr) {
-    if (!ptr){ 
+  if (!ptr) {
     return;
   }
   pthread_mutex_lock(&globallock);
@@ -163,39 +168,66 @@ void myfree(void *ptr) {
   pthread_mutex_unlock(&globallock);
 }
 
+
+void *mycalloc(size_t n,size_t size){
+    if(n!=0 && size>SIZE_MAX/n)return NULL;
+   if(n==0 || size==0) return NULL;
+  void *block=mymalloc(n*size);
+  if(!block)return NULL;
+    memset(block, 0, n*size);
+ return block;
+
+}
+
+
 int main() {
-  
-  //bins 
-  int *a=(int*)mymalloc(8);
-  myfree(a);
-  int *b=(int*)mymalloc(8);
-  printf("reuse same bin a==b:%s\n",a==b?"yes":"no");
+  // all the code here in main is to test the functions of malloc in different
+  // test cases
+  // printf("header size=%zu\n",sizeof(block_header_t));
 
-  char* x=(char*)mymalloc(16);
-  char* y=(char*)mymalloc(16);
-  myfree(x);
-  myfree(y);
-  char* z=(char*)mymalloc(32);
-  printf("coalesce x and y though addresses are same x==z:%s\n",(void*)x==(void*)z?"yes":"no");
+  int* arr=(int*)mycalloc(10,sizeof(int));
+  int zerocheck=1;
+  for(int i=0;i<10;i++){
+    if(arr[i]!=0)zerocheck=0;
+  }
+  printf("mycalloc has intialized all bytes to 0: %s\n",zerocheck==1?"yes":"no");
 
-  char* large=(char*)mymalloc(64);
-  myfree(large);
-  char* sm1=(char*)mymalloc(8);
-  char* sm2=(char*)mymalloc(8);
-block_header_t *h1 = (block_header_t *)sm1 - 1;
-block_header_t *h2 = (block_header_t *)sm2 - 1;
-printf("small1 block size: %zu\n", h1->size);
-printf("small2 block size: %zu\n", h2->size);
-printf("actual gap: %ld\n", (char *)sm2 - (char *)sm1);
-printf("expected gap: %zu\n", 8 + sizeof(block_header_t));
-  printf("split large with sm1 and sm2 i.e sm1==large:%s\n",(void*)large==(void*)sm1?"yes":"no");
-  printf("sm2->data is sm1 + sizeof(header) i.e sm2-sm1=8+sizeof(header):%s\n",(char*)sm2-(char*)sm1==8+sizeof(block_header_t)?"yes":"no");
-
-void* n=mymalloc(0);//null on 0 size test 
-printf("when size is 0 we get NULL:%s\n",n==NULL?"yes":"no");
+  void* overflow=(void*)mycalloc(SIZE_MAX, 2);
+  printf("calloc cannot asign larger size than max size of size_t:%s\n",overflow==NULL?"yes":"no");
 
 
-
+  // bins
+  //  int *a = (int *)mymalloc(8);
+  // myfree(a);
+  // int *b = (int *)mymalloc(8);
+  // printf("reuse same bin a==b:%s\n", a == b ? "yes" : "no");
+  //
+  // char *x = (char *)mymalloc(16);
+  // char *y = (char *)mymalloc(16);
+  // myfree(x);
+  // myfree(y);
+  // char *z = (char *)mymalloc(32);
+  // printf("coalesce x and y though addresses are same x==z:%s\n",
+  //        (void *)x == (void *)z ? "yes" : "no");
+  //
+  // char *large = (char *)mymalloc(64);
+  // myfree(large);
+  // char *sm1 = (char *)mymalloc(8);
+  // char *sm2 = (char *)mymalloc(8);
+  // block_header_t *h1 = (block_header_t *)sm1 - 1;
+  // block_header_t *h2 = (block_header_t *)sm2 - 1;
+  // printf("small1 block size: %zu\n", h1->size);
+  // printf("small2 block size: %zu\n", h2->size);
+  // printf("actual gap: %ld\n", (char *)sm2 - (char *)sm1);
+  // printf("expected gap: %zu\n", 8 + sizeof(block_header_t));
+  // printf("split large with sm1 and sm2 i.e sm1==large:%s\n",
+  //        (void *)large == (void *)sm1 ? "yes" : "no");
+  // printf("sm2->data is sm1 + sizeof(header) i.e sm2-sm1=8+sizeof(header):%s\n",
+  //        (char *)sm2 - (char *)sm1 == 8 + sizeof(block_header_t) ? "yes"
+  //                                                                : "no");
+  //
+  // void *n = mymalloc(0); // null on 0 size test
+  // printf("when size is 0 we get NULL:%s\n", n == NULL ? "yes" : "no");
 
   // coalesce
   // char *a = (char *)mymalloc(10);
@@ -240,5 +272,8 @@ printf("when size is 0 we get NULL:%s\n",n==NULL?"yes":"no");
   // printf("a and b share same address:%s\n",a==b?"yes":"no");
   // printf("b and c are on same address:%s\n",b==c?"yes":"no");
   // printf("gap between b and c:%ld\n",(char*)c-(char*)b);
+  //
+  //
+  //
   return 0;
 }
