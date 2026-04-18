@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 #define NUM_BINS 8
 #define ALIGN(size) (((size) + 7) & ~7)
@@ -18,7 +19,14 @@ typedef struct block_header {
 
 static block_header_t *bins[NUM_BINS];
 
-pthread_mutex_t globallock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t bin_locks[NUM_BINS];
+
+void allocator_init() {
+  for (int i = 0; i < NUM_BINS; i++) {
+    pthread_mutex_init(&bin_locks[i], NULL);
+  }
+}
+
 int bin_index(size_t size) {
   if (size <= 8)
     return 0;
@@ -51,13 +59,14 @@ void bin_remove(block_header_t *block) {
 }
 
 static block_header_t *lastblock = NULL;
+pthread_mutex_t heaplock = PTHREAD_MUTEX_INITIALIZER;
 
 block_header_t *reqestspace(block_header_t *last, size_t size) {
   block_header_t *block = sbrk(0);
   void *request = sbrk(sizeof(block_header_t) + size);
-  if (request == (void *)-1)
+  if (request == (void *)-1) {
     return NULL;
-
+  }
   block->size = size;
   block->isfree = 0;
   block->prev = last;
@@ -69,7 +78,7 @@ block_header_t *reqestspace(block_header_t *last, size_t size) {
   }
   lastblock = block;
   return block;
-}
+};
 
 void splitblocks(block_header_t *block, size_t size) {
   block_header_t *leftover = (block_header_t *)((char *)(block + 1) + size);
@@ -87,10 +96,36 @@ void splitblocks(block_header_t *block, size_t size) {
     lastblock = leftover;
 }
 
+int idxcmp(const void *a, const void *b) { return (*(int *)a - *(int *)b); }
+// lock 2 bins in ascending order to avoid deadlock in every thread
+void lock_bins(int *indices, int n) {
+  qsort(indices, n, sizeof(int), idxcmp);
+  for (int i = 0; i < n; i++) {
+    if (i == 0 || indices[i] != indices[i - 1]) {
+      pthread_mutex_lock(&bin_locks[indices[i]]);
+    }
+  }
+}
+
+void unlock_bins(int *indices, int n) {
+  for (int i = n - 1; i >= 0; i--) {
+    if (i == n - 1 || indices[i] != indices[i + 1]) {
+      pthread_mutex_unlock(&bin_locks[indices[i]]);
+    }
+  }
+}
+
 void coalesce(block_header_t *block) {
+
   // prev is free
   if (block->prev && block->isfree && block->prev->isfree &&
       (char *)(block->prev + 1) + block->prev->size == (char *)block) {
+    int previndex = bin_index(block->prev->size);
+    int blk_index = bin_index(block->size);
+    int updsizeidx =
+        bin_index(block->prev->size + sizeof(block_header_t) + block->size);
+    int indices[3] = {previndex, blk_index, updsizeidx};
+    lock_bins(indices, 3);
     bin_remove(block->prev);
     bin_remove(block);
     if (block == lastblock)
@@ -102,11 +137,18 @@ void coalesce(block_header_t *block) {
       block->next->prev = block->prev;
     }
     bin_insert(block->prev);
-    block=block->prev;
+    block = block->prev;
+    unlock_bins(indices, 3);
   }
   // next is free
   if (block->next && block->isfree && block->next->isfree &&
       ((char *)(block + 1) + block->size == (char *)block->next)) {
+    int nxtindex = bin_index(block->next->size);
+    int blk_index = bin_index(block->size);
+    int newidx =
+        bin_index(block->size + sizeof(block_header_t) + block->next->size);
+    int indices[3] = {nxtindex, blk_index, newidx};
+    lock_bins(indices, 3);
     bin_remove(block->next);
     bin_remove(block);
     if (block->next == lastblock)
@@ -116,18 +158,23 @@ void coalesce(block_header_t *block) {
     if (block->next)
       block->next->prev = block;
     bin_insert(block);
+    unlock_bins(indices, 3);
   }
 }
 
-block_header_t *find_free_block(size_t size) {
+block_header_t *find_free_block(size_t size, int *lock_index) {
   int index = bin_index(size);
   while (index < NUM_BINS) {
+    pthread_mutex_lock(&bin_locks[index]);
     block_header_t *block = bins[index];
     while (block) {
-      if (block->size >= size)
+      if (block->size >= size) {
+        *lock_index = index;
         return block;
+      }
       block = block->bin_next;
     }
+    pthread_mutex_unlock(&bin_locks[index]);
     index++;
   }
   return NULL;
@@ -137,23 +184,29 @@ void *mymalloc(size_t size) {
   if (size == 0)
     return NULL;
   size = ALIGN(size);
-  pthread_mutex_lock(&globallock);
-  block_header_t *block = find_free_block(size);
+  pthread_mutex_lock(&heaplock);
+  int lock_index;
+  block_header_t *block = find_free_block(size, &lock_index);
 
   if (block) {
     bin_remove(block); // remove block before splitting to avoid bin confusions
+    pthread_mutex_unlock(&bin_locks[lock_index]);
     if (block->size >= size + sizeof(block_header_t) + 1) {
+      int leftover_index =
+          bin_index(block->size - size - sizeof(block_header_t));
+      pthread_mutex_lock(&bin_locks[leftover_index]);
       splitblocks(block, size);
+      pthread_mutex_unlock(&bin_locks[leftover_index]);
     }
     block->isfree = 0;
   } else {
     block = reqestspace(lastblock, size);
     if (!block) {
-      pthread_mutex_unlock(&globallock);
+      pthread_mutex_unlock(&heaplock);
       return NULL;
     }
   }
-  pthread_mutex_unlock(&globallock);
+  pthread_mutex_unlock(&heaplock);
   return (void *)(block + 1);
 }
 
@@ -161,13 +214,13 @@ void myfree(void *ptr) {
   if (!ptr) {
     return;
   }
-  pthread_mutex_lock(&globallock);
+  pthread_mutex_lock(&heaplock);
 
   block_header_t *block = (block_header_t *)ptr - 1;
   block->isfree = 1;
   bin_insert(block);
   coalesce(block);
-  pthread_mutex_unlock(&globallock);
+  pthread_mutex_unlock(&heaplock);
 }
 
 void *mycalloc(size_t n, size_t size) {
@@ -182,17 +235,19 @@ void *mycalloc(size_t n, size_t size) {
   return block;
 }
 
-void *myrealloc(void* blk,size_t size) {
+void *myrealloc(void *blk, size_t size) { 
   if (size == 0) {
-    myfree(blk);
+    myfree(blk); 
     return NULL;
   }
+  pthread_mutex_lock(&heaplock);
   block_header_t *block = (block_header_t *)blk - 1;
   if (block->next) {
     if ((char *)(block + 1) + block->size == (char *)block->next &&
         block->next->isfree &&
         block->size + sizeof(block_header_t) + block->next->size >= size) {
-
+      int adjidx=bin_index(block->next->size);
+      pthread_mutex_lock(&bin_locks[adjidx]);
       bin_remove(block->next);
       if (block->next == lastblock)
         lastblock = block;
@@ -200,55 +255,124 @@ void *myrealloc(void* blk,size_t size) {
       block->next = block->next->next;
       if (block->next)
         block->next->prev = block;
+      pthread_mutex_unlock(&bin_locks[adjidx]);
       if (block->size > size + sizeof(block_header_t) + 8) {
+        int leftoveridx=bin_index(block->size-size-sizeof(block_header_t));
+        pthread_mutex_lock(&bin_locks[leftoveridx]);
         splitblocks(block, size);
+        pthread_mutex_unlock(&bin_locks[leftoveridx]);
       }
+      pthread_mutex_unlock(&heaplock);
       return (void *)(block + 1);
     }
   }
+  pthread_mutex_unlock(&heaplock);
   void *newblock = mymalloc(size);
   memcpy(newblock, blk, block->size);
   myfree(blk);
   return (void *)newblock;
 }
 
+// test case for threads safety
+#define NUM_THREADS 4
+#define ALLOCS_PER_THREAD 100
+
+void *thread_work(void *arg) {
+    int id = *(int *)arg;
+    char *ptrs[ALLOCS_PER_THREAD];
+    size_t sizes[ALLOCS_PER_THREAD];
+
+    // interleave alloc and free randomly
+    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+        sizes[i] = rand() % 512 + 1;
+        ptrs[i] = (char *)mymalloc(sizes[i]);
+        if (ptrs[i]) ptrs[i][0] = id;  // write only 1 byte
+
+        // randomly free a previous allocation
+        if (i > 0 && rand() % 2) {
+            int victim = rand() % i;
+            if (ptrs[victim]) {
+                myfree(ptrs[victim]);
+                ptrs[victim] = NULL;
+            }
+        }
+    }
+
+    // verify and free remaining
+    int corrupted = 0;
+    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+        if (ptrs[i]) {
+            if (ptrs[i][0] != id) corrupted++;
+            myfree(ptrs[i]);
+        }
+    }
+
+    printf("Thread %d - corrupted: %d %s\n",
+           id, corrupted, corrupted == 0 ? "PASS" : "FAIL");
+    return NULL;
+}
+
 int main() {
   // all the code here in main is to test the functions of malloc in different
   // test cases
-  // printf("header size=%zu\n",sizeof(block_header_t)); //size of my block_header is 48 here
+  // printf("header size=%zu\n",sizeof(block_header_t)); //size of my
+  // block_header is 48 here
+  allocator_init();
+  // thread safety
+  pthread_t threads[NUM_THREADS];
+  int ids[NUM_THREADS];
 
-  //realloc 
-  char* a=(char*)mymalloc(16);
-  char* b=(char*)mymalloc(64);
-  myfree(b);
-  char* a1=(char*)myrealloc(a,40); //both a and a1 have same address now , modifying any of them changes value at address
-  printf("reallocated b's freed block to a so (a1==a) with extra space:%s\n",(a==a1)?"yes":"no");
+  for (int i = 0; i < NUM_THREADS; i++) {
+    ids[i] = i;
+    pthread_create(&threads[i], NULL, thread_work, &ids[i]);
+  }
 
-  char* x=(char*)mymalloc(16);
-  strcpy(x,"hello");
-  char* y=(char*)mymalloc(16);
-  char* x1=(char*)myrealloc(x,64);
-  printf("x cannot use y's block cause it's not free so x1 allocates new block with x's data\n");
-  printf("now x1 contains hello with extra space:%s\n",strcmp(x1,"hello")==0?"yes":"no");
-  myfree(x1);myfree(y); //x is already freed while creating x1
-  
-  char* z=(char*)mymalloc(sizeof(char));
-  void* z1=myrealloc(z,0);
-  printf("size is 0 so it returns null that is free the block:%s\n",(z1==NULL) ? "yes" : "no");
+  for (int i = 0; i < NUM_THREADS; i++) {
+    pthread_join(threads[i], NULL);
+  }
 
-  //calloc 
-  // int *arr = (int *)mycalloc(10, sizeof(int));
-  // int zerocheck = 1;
-  // for (int i = 0; i < 10; i++) {
-  //   if (arr[i] != 0)
-  //     zerocheck = 0;
-  // }
-  // printf("mycalloc has intialized all bytes to 0: %s\n",
-  //        zerocheck == 1 ? "yes" : "no");
+  printf("all threads done\n");
+
+  // realloc
+  // char *a = (char *)mymalloc(16);
+  // char *b = (char *)mymalloc(64);
+  // myfree(b);
+  // char *a1 = (char *)myrealloc(
+  //     a, 40); // both a and a1 have same address now , modifying any of them
+  //             // changes value at address
+  // printf("reallocated b's freed block to a so (a1==a) with extra space:%s\n",
+  //        (a == a1) ? "yes" : "no");
   //
-  // void *overflow = (void *)mycalloc(SIZE_MAX, 2);
-  // printf("calloc cannot asign larger size than max size of size_t:%s\n",
-  //        overflow == NULL ? "yes" : "no");
+  // char *x = (char *)mymalloc(16);
+  // strcpy(x, "hello");
+  // char *y = (char *)mymalloc(16);
+  // char *x1 = (char *)myrealloc(x, 64);
+  // printf("x cannot use y's block cause it's not free so x1 allocates new
+  // block "
+  //        "with x's data\n");
+  // printf("now x1 contains hello with extra space:%s\n",
+  //        strcmp(x1, "hello") == 0 ? "yes" : "no");
+  // myfree(x1);
+  // myfree(y); // x is already freed while creating x1
+  //
+  // char *z = (char *)mymalloc(sizeof(char));
+  // void *z1 = myrealloc(z, 0);
+  // printf("size is 0 so it returns null that is free the block:%s\n",
+  //        (z1 == NULL) ? "yes" : "no");
+
+  // calloc
+  //  int *arr = (int *)mycalloc(10, sizeof(int));
+  //  int zerocheck = 1;
+  //  for (int i = 0; i < 10; i++) {
+  //    if (arr[i] != 0)
+  //      zerocheck = 0;
+  //  }
+  //  printf("mycalloc has intialized all bytes to 0: %s\n",
+  //         zerocheck == 1 ? "yes" : "no");
+  //
+  //  void *overflow = (void *)mycalloc(SIZE_MAX, 2);
+  //  printf("calloc cannot asign larger size than max size of size_t:%s\n",
+  //         overflow == NULL ? "yes" : "no");
 
   // bins
   //  int *a = (int *)mymalloc(8);
