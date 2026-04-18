@@ -182,7 +182,7 @@ void *mycalloc(size_t n, size_t size) {
   return block;
 }
 
-void *myrealloc(size_t size, void *blk) {
+void *myrealloc(void* blk,size_t size) {
   if (size == 0) {
     myfree(blk);
     return NULL;
@@ -215,26 +215,27 @@ void *myrealloc(size_t size, void *blk) {
 int main() {
   // all the code here in main is to test the functions of malloc in different
   // test cases
-  // printf("header size=%zu\n",sizeof(block_header_t));
+  // printf("header size=%zu\n",sizeof(block_header_t)); //size of my block_header is 48 here
 
-  // //realloc 
-  // char* a=(char*)mymalloc(16);
-  // char* b=(char*)mymalloc(64);
-  // myfree(b);
-  // char* a1=(char*)myrealloc(40,a); //both a and a1 have same address now , modifying any of them changes value at address
-  // printf("reallocated b's freed block to a so (a1==a) with extra space:%s\n",(a==a1)?"yes":"no");
-  //
-  // char* x=(char*)mymalloc(16);
-  // strcpy(x,"hello");
-  // char* y=(char*)mymalloc(16);
-  // char* x1=(char*)myrealloc(64,x);
-  // printf("x cannot use y's block cause it's not free so x1 allocates new block with x's data\n");
-  // printf("now x1 contains hello with extra space:%s\n",strcmp(x1,"hello")==0?"yes":"no");
-  // myfree(x1);myfree(y); //x is already freed while creating x1
+  //realloc 
+  char* a=(char*)mymalloc(16);
+  char* b=(char*)mymalloc(64);
+  myfree(b);
+  char* a1=(char*)myrealloc(a,40); //both a and a1 have same address now , modifying any of them changes value at address
+  printf("reallocated b's freed block to a so (a1==a) with extra space:%s\n",(a==a1)?"yes":"no");
 
-  char* z=(char*)mymalloc(16);
-  void* z1=realloc(z,0);
+  char* x=(char*)mymalloc(16);
+  strcpy(x,"hello");
+  char* y=(char*)mymalloc(16);
+  char* x1=(char*)myrealloc(x,64);
+  printf("x cannot use y's block cause it's not free so x1 allocates new block with x's data\n");
+  printf("now x1 contains hello with extra space:%s\n",strcmp(x1,"hello")==0?"yes":"no");
+  myfree(x1);myfree(y); //x is already freed while creating x1
+  
+  char* z=(char*)mymalloc(sizeof(char));
+  void* z1=myrealloc(z,0);
   printf("size is 0 so it returns null that is free the block:%s\n",(z1==NULL) ? "yes" : "no");
+
   //calloc 
   // int *arr = (int *)mycalloc(10, sizeof(int));
   // int zerocheck = 1;
