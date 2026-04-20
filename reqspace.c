@@ -6,11 +6,13 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #define NUM_BINS 8
 #define ALIGN(size) (((size) + 7) & ~7)
 typedef struct block_header {
   size_t size;
   int isfree;
+  int ismmapped;
   struct block_header *next;
   struct block_header *prev;
   struct block_header *bin_next;
@@ -20,6 +22,8 @@ typedef struct block_header {
 static block_header_t *bins[NUM_BINS];
 
 pthread_mutex_t bin_locks[NUM_BINS];
+
+#define LARGE_ALLOC 131072
 
 void allocator_init() {
   for (int i = 0; i < NUM_BINS; i++) {
@@ -60,15 +64,46 @@ void bin_remove(block_header_t *block) {
 
 static block_header_t *lastblock = NULL;
 pthread_mutex_t heaplock = PTHREAD_MUTEX_INITIALIZER;
+#define CHUNK_SIZE (2*1024*1024) // chunk size of 2mb for fixed chunks in mmap
+static block_header_t *current_chunk=NULL;
+static size_t chunk_remaining=0;
+
 
 block_header_t *reqestspace(block_header_t *last, size_t size) {
-  block_header_t *block = sbrk(0);
-  void *request = sbrk(sizeof(block_header_t) + size);
-  if (request == (void *)-1) {
-    return NULL;
+  // block_header_t *block = sbrk(0);
+  // if (block == (void *)-1) {
+  //   return NULL;
+  // }
+  size_t needed=ALIGN(sizeof(block_header_t)+size);
+  if(chunk_remaining<needed){
+    if(chunk_remaining>=sizeof(block_header_t)+8){
+      block_header_t* leftover=(block_header_t*)current_chunk;
+      size_t usable=chunk_remaining-sizeof(block_header_t);
+      usable=usable & ~7;
+      if(usable>=8){
+      leftover->size=usable;
+        leftover->isfree=1;
+        leftover->ismmapped=0;
+        leftover->prev=NULL;
+        leftover->next=NULL;
+        leftover->bin_next=NULL;
+        leftover->bin_prev=NULL;
+      int bindex=bin_index(leftover->size);
+      pthread_mutex_lock(&bin_locks[bindex]);
+      bin_insert(leftover);
+      pthread_mutex_unlock(&bin_locks[bindex]);
+      }
+    }
+    current_chunk= mmap(NULL,CHUNK_SIZE,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(current_chunk==MAP_FAILED)return NULL;
+    chunk_remaining=CHUNK_SIZE;
   }
-  block->size = size;
+  block_header_t* block=(block_header_t*)current_chunk;
+  current_chunk=(block_header_t*)((char*)current_chunk+needed);
+  chunk_remaining-=needed;
+   block->size = ALIGN(size);
   block->isfree = 0;
+  block->ismmapped=0;
   block->prev = last;
   block->next = NULL;
   block->bin_next = NULL;
@@ -183,7 +218,7 @@ block_header_t *find_free_block(size_t size, int *lock_index) {
 void *mymalloc(size_t size) {
   if (size == 0)
     return NULL;
-  size = ALIGN(size);
+   size = ALIGN(size);
   pthread_mutex_lock(&heaplock);
   int lock_index;
   block_header_t *block = find_free_block(size, &lock_index);
@@ -200,6 +235,22 @@ void *mymalloc(size_t size) {
     }
     block->isfree = 0;
   } else {
+    if(size>=LARGE_ALLOC){
+    block=mmap(NULL, sizeof(block_header_t)+size, PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS, -1,0);
+    if(block==MAP_FAILED){
+        pthread_mutex_unlock(&heaplock);
+        return NULL;
+      }
+    block->size=size;
+    block->ismmapped=1;
+    block->isfree=0;
+    block->next = NULL;
+    block->prev = NULL;
+    block->bin_next = NULL;
+    block->bin_prev = NULL;
+    pthread_mutex_unlock(&heaplock);
+    return (void*)(block+1);
+  }
     block = reqestspace(lastblock, size);
     if (!block) {
       pthread_mutex_unlock(&heaplock);
@@ -215,8 +266,12 @@ void myfree(void *ptr) {
     return;
   }
   pthread_mutex_lock(&heaplock);
-
   block_header_t *block = (block_header_t *)ptr - 1;
+  if(block->ismmapped){
+    munmap(block,sizeof(block_header_t)+block->size);
+    pthread_mutex_unlock(&heaplock);
+    return;
+  }
   block->isfree = 1;
   bin_insert(block);
   coalesce(block);
@@ -310,12 +365,18 @@ void *myrealloc(void *blk, size_t size) {
 //     return NULL;
 // }
 
+
+
+
+
 int main() {
   // all the code here in main is to test the functions of malloc in different
   // test cases
   // printf("header size=%zu\n",sizeof(block_header_t)); //size of my
   // block_header is 48 here
   allocator_init();
+
+
   // thread safety
   // pthread_t threads[NUM_THREADS];
   // int ids[NUM_THREADS];
@@ -330,6 +391,8 @@ int main() {
   // }
   //
   // printf("all threads done\n");
+
+
 
   // realloc
   // char *a = (char *)mymalloc(16);
@@ -358,6 +421,9 @@ int main() {
   // printf("size is 0 so it returns null that is free the block:%s\n",
   //        (z1 == NULL) ? "yes" : "no");
 
+
+
+
   // calloc
   //  int *arr = (int *)mycalloc(10, sizeof(int));
   //  int zerocheck = 1;
@@ -371,6 +437,9 @@ int main() {
   //  void *overflow = (void *)mycalloc(SIZE_MAX, 2);
   //  printf("calloc cannot asign larger size than max size of size_t:%s\n",
   //         overflow == NULL ? "yes" : "no");
+
+
+
 
   // bins
   //  int *a = (int *)mymalloc(8);
@@ -406,6 +475,10 @@ int main() {
   // void *n = mymalloc(0); // null on 0 size test
   // printf("when size is 0 we get NULL:%s\n", n == NULL ? "yes" : "no");
 
+
+
+
+
   // coalesce
   // char *a = (char *)mymalloc(10);
   // char *b = (char *)mymalloc(10);
@@ -419,6 +492,9 @@ int main() {
   // printf("both are same though coalescing works:%s\n",
   //        (void *)a == (void *)d ? "Yes" : "no");
 
+
+
+
   // splitting
   //  char* a=(char*)mymalloc(100);
   //  myfree(a);
@@ -431,6 +507,9 @@ int main() {
   //  printf("c at %p\n",(void*)c);
   //
   //  printf("gap between b and c:%ld\n",(char*)c-(char*)b);
+
+
+
 
   // find free block
   // int* a=(int*)mymalloc(sizeof(int));
@@ -450,7 +529,7 @@ int main() {
   // printf("b and c are on same address:%s\n",b==c?"yes":"no");
   // printf("gap between b and c:%ld\n",(char*)c-(char*)b);
   //
-  //
-  //
+  
+  
   return 0;
 }
