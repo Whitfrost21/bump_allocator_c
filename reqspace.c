@@ -329,41 +329,41 @@ void *myrealloc(void *blk, size_t size) {
 }
 
 // test case for threads safety
-// #define NUM_THREADS 4
-// #define ALLOCS_PER_THREAD 100
-// //
-// void *thread_work(void *arg) {
-//     int id = *(int *)arg;
-//     char *ptrs[ALLOCS_PER_THREAD];
-//     size_t sizes[ALLOCS_PER_THREAD];
+#define NUM_THREADS 4
+#define ALLOCS_PER_THREAD 100
 //
-//     // interleave alloc and free randomly
-//     for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
-//         sizes[i] = rand() % 512 + 1;
-//         ptrs[i] = (char *)mymalloc(sizes[i]);
-//         if (ptrs[i]) ptrs[i][0] = id;  // write only 1 byte
-//
-//         // randomly free a previous allocation
-//         if (i > 0 && rand() % 2) {
-//             int victim = rand() % i;
-//             if (ptrs[victim]) {
-//                 myfree(ptrs[victim]);
-//                 ptrs[victim] = NULL;
-//             }
-//         }
-//     }
-//     // verify and free remaining
-//     int corrupted = 0;
-//     for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
-//         if (ptrs[i]) {
-//             if (ptrs[i][0] != id) corrupted++;
-//             myfree(ptrs[i]);
-//         }
-//     }
-//     printf("Thread %d - corrupted: %d %s\n",
-//            id, corrupted, corrupted == 0 ? "PASS" : "FAIL");
-//     return NULL;
-// }
+void *thread_work(void *arg) {
+    int id = *(int *)arg;
+    char *ptrs[ALLOCS_PER_THREAD];
+    size_t sizes[ALLOCS_PER_THREAD];
+
+    // interleave alloc and free randomly
+    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+        sizes[i] = rand() % 512 + 1;
+        ptrs[i] = (char *)mymalloc(sizes[i]);
+        if (ptrs[i]) ptrs[i][0] = id;  // write only 1 byte
+
+        // randomly free a previous allocation
+        if (i > 0 && rand() % 2) {
+            int victim = rand() % i;
+            if (ptrs[victim]) {
+                myfree(ptrs[victim]);
+                ptrs[victim] = NULL;
+            }
+        }
+    }
+    // verify and free remaining
+    int corrupted = 0;
+    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+        if (ptrs[i]) {
+            if (ptrs[i][0] != id) corrupted++;
+            myfree(ptrs[i]);
+        }
+    }
+    printf("Thread %d - corrupted: %d %s\n",
+           id, corrupted, corrupted == 0 ? "PASS" : "FAIL");
+    return NULL;
+}
 
 
 
@@ -378,19 +378,19 @@ int main() {
 
 
   // thread safety
-  // pthread_t threads[NUM_THREADS];
-  // int ids[NUM_THREADS];
-  //
-  // for (int i = 0; i < NUM_THREADS; i++) {
-  //   ids[i] = i;
-  //   pthread_create(&threads[i], NULL, thread_work, &ids[i]);
-  // }
-  //
-  // for (int i = 0; i < NUM_THREADS; i++) {
-  //   pthread_join(threads[i], NULL);
-  // }
-  //
-  // printf("all threads done\n");
+  pthread_t threads[NUM_THREADS];
+  int ids[NUM_THREADS];
+
+  for (int i = 0; i < NUM_THREADS; i++) {
+    ids[i] = i;
+    pthread_create(&threads[i], NULL, thread_work, &ids[i]);
+  }
+
+  for (int i = 0; i < NUM_THREADS; i++) {
+    pthread_join(threads[i], NULL);
+  }
+
+  printf("all threads done\n");
 
 
 
