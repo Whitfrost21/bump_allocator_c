@@ -121,6 +121,9 @@ void splitblocks(block_header_t *block, size_t size) {
   leftover->isfree = 1;
   leftover->next = block->next;
   leftover->prev = block;
+  leftover->ismmapped=0;
+  leftover->bin_prev=NULL;
+  leftover->bin_next=NULL;
   if (block->next) {
     block->next->prev = leftover;
   }
@@ -297,6 +300,13 @@ void *myrealloc(void *blk, size_t size) {
   }
   pthread_mutex_lock(&heaplock);
   block_header_t *block = (block_header_t *)blk - 1;
+  if(block->ismmapped){
+   pthread_mutex_unlock(&heaplock);
+    void* newblock=mymalloc(size);
+    memcpy(newblock, block,block->size);
+    munmap(block,sizeof(block_header_t)+block->size);
+    return newblock;
+  }
   if (block->next) {
     if ((char *)(block + 1) + block->size == (char *)block->next &&
         block->next->isfree &&
@@ -329,41 +339,41 @@ void *myrealloc(void *blk, size_t size) {
 }
 
 // test case for threads safety
-#define NUM_THREADS 4
-#define ALLOCS_PER_THREAD 100
+// #define NUM_THREADS 4
+// #define ALLOCS_PER_THREAD 100
+// //
+// void *thread_work(void *arg) {
+//     int id = *(int *)arg;
+//     char *ptrs[ALLOCS_PER_THREAD];
+//     size_t sizes[ALLOCS_PER_THREAD];
 //
-void *thread_work(void *arg) {
-    int id = *(int *)arg;
-    char *ptrs[ALLOCS_PER_THREAD];
-    size_t sizes[ALLOCS_PER_THREAD];
-
-    // interleave alloc and free randomly
-    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
-        sizes[i] = rand() % 512 + 1;
-        ptrs[i] = (char *)mymalloc(sizes[i]);
-        if (ptrs[i]) ptrs[i][0] = id;  // write only 1 byte
-
-        // randomly free a previous allocation
-        if (i > 0 && rand() % 2) {
-            int victim = rand() % i;
-            if (ptrs[victim]) {
-                myfree(ptrs[victim]);
-                ptrs[victim] = NULL;
-            }
-        }
-    }
-    // verify and free remaining
-    int corrupted = 0;
-    for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
-        if (ptrs[i]) {
-            if (ptrs[i][0] != id) corrupted++;
-            myfree(ptrs[i]);
-        }
-    }
-    printf("Thread %d - corrupted: %d %s\n",
-           id, corrupted, corrupted == 0 ? "PASS" : "FAIL");
-    return NULL;
-}
+//     // interleave alloc and free randomly
+//     for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+//         sizes[i] = rand() % 512 + 1;
+//         ptrs[i] = (char *)mymalloc(sizes[i]);
+//         if (ptrs[i]) ptrs[i][0] = id;  // write only 1 byte
+//
+//         // randomly free a previous allocation
+//         if (i > 0 && rand() % 2) {
+//             int victim = rand() % i;
+//             if (ptrs[victim]) {
+//                 myfree(ptrs[victim]);
+//                 ptrs[victim] = NULL;
+//             }
+//         }
+//     }
+//     // verify and free remaining
+//     int corrupted = 0;
+//     for (int i = 0; i < ALLOCS_PER_THREAD; i++) {
+//         if (ptrs[i]) {
+//             if (ptrs[i][0] != id) corrupted++;
+//             myfree(ptrs[i]);
+//         }
+//     }
+//     printf("Thread %d - corrupted: %d %s\n",
+//            id, corrupted, corrupted == 0 ? "PASS" : "FAIL");
+//     return NULL;
+// }
 
 
 
@@ -378,48 +388,47 @@ int main() {
 
 
   // thread safety
-  pthread_t threads[NUM_THREADS];
-  int ids[NUM_THREADS];
-
-  for (int i = 0; i < NUM_THREADS; i++) {
-    ids[i] = i;
-    pthread_create(&threads[i], NULL, thread_work, &ids[i]);
-  }
-
-  for (int i = 0; i < NUM_THREADS; i++) {
-    pthread_join(threads[i], NULL);
-  }
-
-  printf("all threads done\n");
+  // pthread_t threads[NUM_THREADS];
+  // int ids[NUM_THREADS];
+  //
+  // for (int i = 0; i < NUM_THREADS; i++) {
+  //   ids[i] = i;
+  //   pthread_create(&threads[i], NULL, thread_work, &ids[i]);
+  // }
+  //
+  // for (int i = 0; i < NUM_THREADS; i++) {
+  //   pthread_join(threads[i], NULL);
+  // }
+  //
+  // printf("all threads done\n");
 
 
 
   // realloc
-  // char *a = (char *)mymalloc(16);
-  // char *b = (char *)mymalloc(64);
-  // myfree(b);
-  // char *a1 = (char *)myrealloc(
-  //     a, 40); // both a and a1 have same address now , modifying any of them
-  //             // changes value at address
-  // printf("reallocated b's freed block to a so (a1==a) with extra space:%s\n",
-  //        (a == a1) ? "yes" : "no");
-  //
-  // char *x = (char *)mymalloc(16);
-  // strcpy(x, "hello");
-  // char *y = (char *)mymalloc(16);
-  // char *x1 = (char *)myrealloc(x, 64);
-  // printf("x cannot use y's block cause it's not free so x1 allocates new
-  // block "
-  //        "with x's data\n");
-  // printf("now x1 contains hello with extra space:%s\n",
-  //        strcmp(x1, "hello") == 0 ? "yes" : "no");
-  // myfree(x1);
-  // myfree(y); // x is already freed while creating x1
-  //
-  // char *z = (char *)mymalloc(sizeof(char));
-  // void *z1 = myrealloc(z, 0);
-  // printf("size is 0 so it returns null that is free the block:%s\n",
-  //        (z1 == NULL) ? "yes" : "no");
+  char *a = (char *)mymalloc(16);
+  char *b = (char *)mymalloc(64);
+  myfree(b);
+  char *a1 = (char *)myrealloc(
+      a, 40); // both a and a1 have same address now , modifying any of them
+              // changes value at address
+  printf("reallocated b's freed block to a so (a1==a) with extra space:%s\n",
+         (a == a1) ? "yes" : "no");
+
+  char *x = (char *)mymalloc(16);
+  strcpy(x, "hello");
+  char *y = (char *)mymalloc(16);
+  char *x1 = (char *)myrealloc(x, 64);
+  printf("x cannot use y's block cause it's not free so x1 allocates new block "
+         "with x's data\n");
+  printf("now x1 contains hello with extra space:%s\n",
+         strcmp(x1, "hello") == 0 ? "yes" : "no");
+  myfree(x1);
+  myfree(y); // x is already freed while creating x1
+
+  char *z = (char *)mymalloc(sizeof(char));
+  void *z1 = myrealloc(z, 0);
+  printf("size is 0 so it returns null that is free the block:%s\n",
+         (z1 == NULL) ? "yes" : "no");
 
 
 
