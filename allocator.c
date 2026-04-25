@@ -23,15 +23,8 @@ typedef struct block_header {
 
 static block_header_t *bins[NUM_BINS];
 
-pthread_mutex_t bin_locks[NUM_BINS];
 
 #define LARGE_ALLOC 131072
-
-void allocator_init() {
-  for (int i = 0; i < NUM_BINS; i++) {
-    pthread_mutex_init(&bin_locks[i], NULL);
-  }
-}
 
 int bin_index(size_t size) {
   if (size <= 8)
@@ -42,7 +35,7 @@ int bin_index(size_t size) {
   return index;
 }
 
-void bin_insertnolock(block_header_t *block) {
+void bin_insert(block_header_t *block) {
   int index = bin_index(block->size);
   block->bin_prev = NULL;
   block->bin_next = bins[index];
@@ -51,8 +44,10 @@ void bin_insertnolock(block_header_t *block) {
   bins[index] = block;
 }
 
-void bin_removenolock(block_header_t *block) {
+void bin_remove(block_header_t *block) {
   int index = bin_index(block->size);
+
+  if(!block->bin_prev && bins[index]!=block)return ;
   if (block->bin_prev)
     block->bin_prev->bin_next = block->bin_next;
   else
@@ -64,19 +59,6 @@ void bin_removenolock(block_header_t *block) {
   block->bin_prev = NULL;
 }
 
-void bin_insert(block_header_t* block){
-  int index=bin_index(block->size);
-  pthread_mutex_lock(&bin_locks[index]);
-  bin_insertnolock(block);
-  pthread_mutex_unlock(&bin_locks[index]);
-}
-
-void bin_remove(block_header_t* block){
-  int index=bin_index(block->size);
-  pthread_mutex_lock(&bin_locks[index]);
-  bin_removenolock(block);
-  pthread_mutex_unlock(&bin_locks[index]);
-}
 
 static block_header_t *lastblock = NULL;
 pthread_mutex_t heaplock = PTHREAD_MUTEX_INITIALIZER;
@@ -143,43 +125,23 @@ void splitblocks(block_header_t *block, size_t size) {
   }
   block->next = leftover;
   block->size = size;
-  bin_insertnolock(leftover);
+  bin_insert(leftover);
   if (block == lastblock)
     lastblock = leftover;
 }
 
-int idxcmp(const void *a, const void *b) { return (*(int *)a - *(int *)b); }
-// lock 2 bins in ascending order to avoid deadlock in every thread
-void lock_bins(int *indices, int n) {
-  qsort(indices, n, sizeof(int), idxcmp);
-  for (int i = 0; i < n; i++) {
-    if (i == 0 || indices[i] != indices[i - 1]) {
-      pthread_mutex_lock(&bin_locks[indices[i]]);
-    }
-  }
-}
 
-void unlock_bins(int *indices, int n) {
-  for (int i = n - 1; i >= 0; i--) {
-    if (i == n - 1 || indices[i] != indices[i + 1]) {
-      pthread_mutex_unlock(&bin_locks[indices[i]]);
-    }
-  }
-}
+
 
 void coalesce(block_header_t *block) {
 
   // prev is free
   if (block->prev && block->isfree && block->prev->isfree &&
       (char *)(block->prev + 1) + block->prev->size == (char *)block) {
-    int previndex = bin_index(block->prev->size);
-    int blk_index = bin_index(block->size);
-    int updsizeidx =
-        bin_index(block->prev->size + sizeof(block_header_t) + block->size);
-    int indices[3] = {previndex, blk_index, updsizeidx};
-    lock_bins(indices, 3);
-    bin_removenolock(block->prev);
-    bin_removenolock(block);
+   
+   
+    bin_remove(block->prev);
+    bin_remove(block);
     if (block == lastblock){
       lastblock = block->prev;
     }  
@@ -189,19 +151,12 @@ void coalesce(block_header_t *block) {
     if (block->next) {
       block->next->prev = block->prev;
     }
-    bin_insertnolock(block->prev);
+    bin_insert(block->prev);
     block = block->prev;
-    unlock_bins(indices, 3);
   }
   // next is free
   if (block->next && block->isfree && block->next->isfree &&
-      ((char *)(block + 1) + block->size == (char *)block->next)) {
-    int nxtindex = bin_index(block->next->size);
-    int blk_index = bin_index(block->size);
-    int newidx =
-        bin_index(block->size + sizeof(block_header_t) + block->next->size);
-    int indices[3] = {nxtindex, blk_index, newidx};
-    lock_bins(indices, 3);
+      ((char *)(block + 1) + block->size == (char *)block->next)) { 
     bin_remove(block->next);
     bin_remove(block);
     if (block->next == lastblock)
@@ -211,23 +166,19 @@ void coalesce(block_header_t *block) {
     if (block->next)
       block->next->prev = block;
     bin_insert(block);
-    unlock_bins(indices, 3);
   }
 }
 
-block_header_t *find_free_block(size_t size, int *lock_index) {
+block_header_t *find_free_block(size_t size) {
   int index = bin_index(size);
   while (index < NUM_BINS) {
-    pthread_mutex_lock(&bin_locks[index]);
     block_header_t *block = bins[index];
     while (block) {
       if (block->size >= size) {
-        *lock_index = index;
         return block;
       }
       block = block->bin_next;
     }
-    pthread_mutex_unlock(&bin_locks[index]);
     index++;
   }
   return NULL;
@@ -238,18 +189,14 @@ void *mymalloc(size_t size) {
     return NULL;
    size = ALIGN(size);
   pthread_mutex_lock(&heaplock);
-  int lock_index;
-  block_header_t *block = find_free_block(size, &lock_index);
+
+  block_header_t *block = find_free_block(size);
 
   if (block) {
-    bin_removenolock(block); // remove block before splitting to avoid bin confusions
-    pthread_mutex_unlock(&bin_locks[lock_index]);
+    bin_remove(block); // remove block before splitting to avoid bin confusions
     if (block->size >= size + sizeof(block_header_t) + 1) {
-      int leftover_index =
-          bin_index(block->size - size - sizeof(block_header_t));
-      pthread_mutex_lock(&bin_locks[leftover_index]);
+   
       splitblocks(block, size);
-      pthread_mutex_unlock(&bin_locks[leftover_index]);
     }
     block->isfree = 0;
   } else {
@@ -291,7 +238,7 @@ void myfree(void *ptr) {
     return;
   }
   block->isfree = 1;
-  bin_insertnolock(block);
+  bin_insert(block);
   coalesce(block);
   pthread_mutex_unlock(&heaplock);
 }
@@ -320,7 +267,8 @@ void *myrealloc(void *blk, size_t size) {
    pthread_mutex_unlock(&heaplock);
     void* newblock=mymalloc(size);
     if(!newblock)return NULL;
-    memcpy(newblock, blk,oldsize);
+    size_t tocopy=oldsize<size?oldsize:size;
+    memcpy(newblock, blk,tocopy);
     myfree(blk);
     return newblock;
   }
@@ -328,21 +276,15 @@ void *myrealloc(void *blk, size_t size) {
     if ((char *)(block + 1) + block->size == (char *)block->next &&
         block->next->isfree &&
         block->size + sizeof(block_header_t) + block->next->size >= size) {
-      int adjidx=bin_index(block->next->size);
-      pthread_mutex_lock(&bin_locks[adjidx]);
-      bin_removenolock(block->next);
+      bin_remove(block->next);
       if (block->next == lastblock)
         lastblock = block;
       block->size = block->size + sizeof(block_header_t) + block->next->size;
       block->next = block->next->next;
       if (block->next)
         block->next->prev = block;
-      pthread_mutex_unlock(&bin_locks[adjidx]);
       if (block->size > size + sizeof(block_header_t) + 8) {
-        int leftoveridx=bin_index(block->size-size-sizeof(block_header_t));
-        pthread_mutex_lock(&bin_locks[leftoveridx]);
         splitblocks(block, size);
-        pthread_mutex_unlock(&bin_locks[leftoveridx]);
       }
       pthread_mutex_unlock(&heaplock);
       return (void *)(block + 1);
@@ -352,7 +294,7 @@ void *myrealloc(void *blk, size_t size) {
   pthread_mutex_unlock(&heaplock);
   void *newblock = mymalloc(size);
   if(!newblock)return NULL;
-  memcpy(newblock, blk,oldsize);
+  memcpy(newblock, blk,oldsize<size?oldsize:size);
   myfree(blk);
   return (void *)newblock;
 }

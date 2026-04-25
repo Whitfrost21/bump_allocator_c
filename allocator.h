@@ -3,7 +3,6 @@
 
 #include<stddef.h>
 
-void allocator_init();
 void *mymalloc(size_t size);
 void myfree(void* ptr);
 void *mycalloc(size_t n,size_t size);

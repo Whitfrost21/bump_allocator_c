@@ -169,7 +169,6 @@ void test_null_free() {
 
 // ── runner ───────────────────────────────────────────────────────────────────
 int main() {
-    allocator_init();
 
     test_null_free();
 
