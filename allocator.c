@@ -1,5 +1,6 @@
 #include "allocator.h"
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -31,6 +32,8 @@ typedef struct {
 __thread tcache_t tcache = {0};
 
 #define LARGE_ALLOC 131072
+
+alloc_stats_t stats = {0};
 
 int bin_index(size_t size) {
   if (size <= 8)
@@ -223,6 +226,8 @@ void *mymalloc(size_t size) {
           block->isfree = 0;
           block->bin_next = NULL;
           block->bin_prev = NULL;
+          atomic_fetch_add(&stats.tcache_hits, 1);
+          atomic_fetch_add(&stats.live_bytes, block->size);
           return (void *)(block + 1);
         }
         block = block->bin_next;
@@ -245,9 +250,12 @@ void *mymalloc(size_t size) {
     block->prev = NULL;
     block->bin_next = NULL;
     block->bin_prev = NULL;
+    atomic_fetch_add(&stats.mmap_calls, 1);
+    atomic_fetch_add(&stats.live_bytes, size);
     return (void *)(block + 1);
   }
 
+  atomic_fetch_add(&stats.tcache_misses, 1);
   pthread_mutex_lock(&heaplock);
 
   block_header_t *block = find_free_block(size);
@@ -276,7 +284,7 @@ void myfree(void *ptr) {
     return;
   }
   block_header_t *block = (block_header_t *)ptr - 1;
-
+  atomic_fetch_sub(&stats.live_bytes, block->size);
   if (!block->ismmapped) {
     int idx = bin_index(block->size);
     if (tcache.count[idx] >= TCACHE_MAX) {
@@ -293,6 +301,7 @@ void myfree(void *ptr) {
   if (block->ismmapped) {
     munmap(block, sizeof(block_header_t) + block->size);
     pthread_mutex_unlock(&heaplock);
+    atomic_fetch_add(&stats.munmap_calls, 1);
     return;
   }
   block->isfree = 1;
@@ -332,9 +341,9 @@ void *myrealloc(void *blk, size_t size) {
   //   return newblock;
   // }
   //
-    block_header_t *block = (block_header_t *)blk - 1;
-    size_t oldsize = block->size;
-    int wasmmapped = block->ismmapped;
+  block_header_t *block = (block_header_t *)blk - 1;
+  size_t oldsize = block->size;
+  int wasmmapped = block->ismmapped;
 
   // skipping in place expansion cause i dont have any way to differentaite
   // between tcache blocks and global heap blocks if (block->next &&
@@ -369,4 +378,18 @@ void *myrealloc(void *blk, size_t size) {
   memcpy(newblock, blk, oldsize < size ? oldsize : size);
   myfree(blk);
   return (void *)newblock;
+}
+
+void allocator_print_stats(void) {
+  size_t hits = atomic_load(&stats.tcache_hits);
+  size_t misses = atomic_load(&stats.tcache_misses);
+  size_t total = hits + misses;
+
+  printf("\n ===allocator stats===\n");
+  printf("tcache hits: %zu\n", hits);
+  printf("tcache misses: %zu\n", misses);
+  printf("tcache hit rate : %.1f%%\n", total ? 100.0 * hits / total : 0.0);
+  printf("mmap calls: %zu\n", atomic_load(&stats.mmap_calls));
+  printf("munmap calls: %zu\n", atomic_load(&stats.munmap_calls));
+  printf("live bytes: %zu\n", atomic_load(&stats.live_bytes));
 }

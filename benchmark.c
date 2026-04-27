@@ -145,5 +145,9 @@ int main() {
   bench_multithreaded();
 
   printf("\ndone\n");
+
+#ifdef USE_CUSTOM
+  allocator_print_stats();
+#endif
   return 0;
 }
