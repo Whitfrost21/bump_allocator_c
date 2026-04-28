@@ -251,7 +251,7 @@ void *mymalloc(size_t size) {
     block->bin_next = NULL;
     block->bin_prev = NULL;
     atomic_fetch_add(&stats.mmap_calls, 1);
-    atomic_fetch_add(&stats.live_bytes, size);
+// atomic_fetch_add(&stats.live_bytes, size);                                  bug
     return (void *)(block + 1);
   }
 
@@ -391,5 +391,6 @@ void allocator_print_stats(void) {
   printf("tcache hit rate : %.1f%%\n", total ? 100.0 * hits / total : 0.0);
   printf("mmap calls: %zu\n", atomic_load(&stats.mmap_calls));
   printf("munmap calls: %zu\n", atomic_load(&stats.munmap_calls));
-  printf("live bytes: %zu\n", atomic_load(&stats.live_bytes));
+  //live bytes is bugged causing size_t overflow
+  // printf("live bytes: %zu\n", atomic_load(&stats.live_bytes));
 }
