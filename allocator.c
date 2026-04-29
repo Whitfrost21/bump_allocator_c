@@ -227,7 +227,7 @@ void *mymalloc(size_t size) {
           block->bin_next = NULL;
           block->bin_prev = NULL;
           atomic_fetch_add(&stats.tcache_hits, 1);
-          atomic_fetch_add(&stats.live_bytes, block->size);
+          atomic_fetch_add(&stats.alloc_count, 1);
           return (void *)(block + 1);
         }
         block = block->bin_next;
@@ -251,7 +251,7 @@ void *mymalloc(size_t size) {
     block->bin_next = NULL;
     block->bin_prev = NULL;
     atomic_fetch_add(&stats.mmap_calls, 1);
-// atomic_fetch_add(&stats.live_bytes, size);                                  bug
+    atomic_fetch_add(&stats.alloc_count, 1);
     return (void *)(block + 1);
   }
 
@@ -275,6 +275,7 @@ void *mymalloc(size_t size) {
       return NULL;
     }
   }
+  atomic_fetch_add(&stats.alloc_count, 1);
   pthread_mutex_unlock(&heaplock);
   return (void *)(block + 1);
 }
@@ -284,7 +285,6 @@ void myfree(void *ptr) {
     return;
   }
   block_header_t *block = (block_header_t *)ptr - 1;
-  atomic_fetch_sub(&stats.live_bytes, block->size);
   if (!block->ismmapped) {
     int idx = bin_index(block->size);
     if (tcache.count[idx] >= TCACHE_MAX) {
@@ -295,18 +295,20 @@ void myfree(void *ptr) {
     block->bin_prev = NULL;
     tcache.bins[idx] = block;
     tcache.count[idx]++;
+    atomic_fetch_add(&stats.free_count, 1);
     return;
   }
   pthread_mutex_lock(&heaplock);
   if (block->ismmapped) {
     munmap(block, sizeof(block_header_t) + block->size);
-    pthread_mutex_unlock(&heaplock);
     atomic_fetch_add(&stats.munmap_calls, 1);
+    pthread_mutex_unlock(&heaplock);
     return;
   }
   block->isfree = 1;
   bin_insert(block);
   coalesce(block);
+  atomic_fetch_add(&stats.free_count, 1);
   pthread_mutex_unlock(&heaplock);
 }
 
@@ -384,13 +386,17 @@ void allocator_print_stats(void) {
   size_t hits = atomic_load(&stats.tcache_hits);
   size_t misses = atomic_load(&stats.tcache_misses);
   size_t total = hits + misses;
-
+  size_t allocs = atomic_load(&stats.alloc_count);
+  size_t frees = atomic_load(&stats.free_count);
   printf("\n ===allocator stats===\n");
   printf("tcache hits: %zu\n", hits);
   printf("tcache misses: %zu\n", misses);
   printf("tcache hit rate : %.1f%%\n", total ? 100.0 * hits / total : 0.0);
+  printf("total allocs:      %zu\n", allocs);
+  printf("total frees:       %zu\n", frees);
+  printf("live allocations:  %zu\n", allocs - frees);
   printf("mmap calls: %zu\n", atomic_load(&stats.mmap_calls));
   printf("munmap calls: %zu\n", atomic_load(&stats.munmap_calls));
-  //live bytes is bugged causing size_t overflow
-  // printf("live bytes: %zu\n", atomic_load(&stats.live_bytes));
+  // live bytes is bugged causing size_t overflow
+  //  printf("live bytes: %zu\n", atomic_load(&stats.live_bytes));
 }

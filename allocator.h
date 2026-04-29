@@ -9,7 +9,8 @@ typedef struct {
   atomic_size_t mmap_calls;
   atomic_size_t munmap_calls;
   atomic_size_t large_cache_hits;
-  atomic_size_t live_bytes;
+  atomic_size_t alloc_count;
+  atomic_size_t free_count;
 } alloc_stats_t;
 extern alloc_stats_t stats;
 void allocator_print_stats(void);
