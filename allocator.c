@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#define LARGE_CACHE_SIZE 8
 #define NUM_BINS 8
 #define ALIGN(size) (((size) + 7) & ~7)
 typedef struct block_header {
@@ -24,6 +25,8 @@ typedef struct block_header {
 
 static block_header_t *bins[NUM_BINS];
 
+static block_header_t *large_cache_blocks[LARGE_CACHE_SIZE];
+static int large_cache_count = 0;
 #define TCACHE_MAX 64
 typedef struct {
   block_header_t *bins[NUM_BINS];
@@ -34,6 +37,10 @@ __thread tcache_t tcache = {0};
 #define LARGE_ALLOC 131072
 
 alloc_stats_t stats = {0};
+__thread size_t local_hits = 0;
+__thread size_t local_misses = 0;
+__thread size_t local_allocs = 0;
+__thread size_t local_frees = 0;
 
 int bin_index(size_t size) {
   if (size <= 8)
@@ -191,6 +198,11 @@ block_header_t *find_free_block(size_t size) {
 }
 
 void flush_tcache(int idx) {
+  atomic_fetch_add(&stats.alloc_count, local_allocs);
+  atomic_fetch_add(&stats.free_count, local_frees);
+  atomic_fetch_add(&stats.tcache_hits, local_hits);
+  atomic_fetch_add(&stats.tcache_misses, local_misses);
+  local_frees = local_misses = local_hits = local_allocs = 0;
   pthread_mutex_lock(&heaplock);
   block_header_t *block = tcache.bins[idx];
   while (block) {
@@ -226,8 +238,8 @@ void *mymalloc(size_t size) {
           block->isfree = 0;
           block->bin_next = NULL;
           block->bin_prev = NULL;
-          atomic_fetch_add(&stats.tcache_hits, 1);
-          atomic_fetch_add(&stats.alloc_count, 1);
+          local_hits++;
+          local_allocs++;
           return (void *)(block + 1);
         }
         block = block->bin_next;
@@ -236,10 +248,25 @@ void *mymalloc(size_t size) {
   }
 
   if (size >= LARGE_ALLOC) {
-
-    block_header_t *block =
-        mmap(NULL, sizeof(block_header_t) + size, PROT_READ | PROT_WRITE,
-             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pthread_mutex_lock(&heaplock);
+    block_header_t *block;
+    for (int i = 0; i < large_cache_count; i++) {
+      if (large_cache_blocks[i]->size >= size &&
+          large_cache_blocks[i]->size <= size * 2) {
+        block = large_cache_blocks[i];
+        large_cache_blocks[i] = large_cache_blocks[--large_cache_count];
+        pthread_mutex_unlock(&heaplock);
+        size_t wasted = block->size - size;
+        atomic_fetch_add(&stats.large_cache_wasted_bytes, wasted);
+        atomic_fetch_add(&stats.large_cache_hits, 1);
+        local_hits++;
+        local_allocs++;
+        return (void *)(block + 1);
+      }
+    }
+    pthread_mutex_unlock(&heaplock);
+    block = mmap(NULL, sizeof(block_header_t) + size, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (block == MAP_FAILED) {
       return NULL;
     }
@@ -251,11 +278,11 @@ void *mymalloc(size_t size) {
     block->bin_next = NULL;
     block->bin_prev = NULL;
     atomic_fetch_add(&stats.mmap_calls, 1);
-    atomic_fetch_add(&stats.alloc_count, 1);
+    local_allocs++;
     return (void *)(block + 1);
   }
 
-  atomic_fetch_add(&stats.tcache_misses, 1);
+  local_misses++;
   pthread_mutex_lock(&heaplock);
 
   block_header_t *block = find_free_block(size);
@@ -275,7 +302,7 @@ void *mymalloc(size_t size) {
       return NULL;
     }
   }
-  atomic_fetch_add(&stats.alloc_count, 1);
+  local_allocs++;
   pthread_mutex_unlock(&heaplock);
   return (void *)(block + 1);
 }
@@ -295,20 +322,26 @@ void myfree(void *ptr) {
     block->bin_prev = NULL;
     tcache.bins[idx] = block;
     tcache.count[idx]++;
-    atomic_fetch_add(&stats.free_count, 1);
+    local_frees++;
     return;
   }
   pthread_mutex_lock(&heaplock);
   if (block->ismmapped) {
-    munmap(block, sizeof(block_header_t) + block->size);
-    atomic_fetch_add(&stats.munmap_calls, 1);
+    if (large_cache_count < LARGE_CACHE_SIZE) {
+      large_cache_blocks[large_cache_count++] = block;
+      atomic_fetch_add(&stats.free_count, 1);
+    } else {
+      munmap(block, sizeof(block_header_t) + block->size);
+      atomic_fetch_add(&stats.munmap_calls, 1);
+      local_frees++;
+    }
     pthread_mutex_unlock(&heaplock);
     return;
   }
   block->isfree = 1;
   bin_insert(block);
   coalesce(block);
-  atomic_fetch_add(&stats.free_count, 1);
+  local_frees++;
   pthread_mutex_unlock(&heaplock);
 }
 
@@ -345,8 +378,7 @@ void *myrealloc(void *blk, size_t size) {
   //
   block_header_t *block = (block_header_t *)blk - 1;
   size_t oldsize = block->size;
-  int wasmmapped = block->ismmapped;
-
+  int wasmmapped = block->ismmapped; 
   // skipping in place expansion cause i dont have any way to differentaite
   // between tcache blocks and global heap blocks if (block->next &&
   // block->next->isfree &&
@@ -383,6 +415,12 @@ void *myrealloc(void *blk, size_t size) {
 }
 
 void allocator_print_stats(void) {
+  atomic_fetch_add(&stats.alloc_count, local_allocs);
+  atomic_fetch_add(&stats.free_count, local_frees);
+  atomic_fetch_add(&stats.tcache_hits, local_hits);
+  atomic_fetch_add(&stats.tcache_misses, local_misses);
+  local_frees = local_misses = local_hits = local_allocs = 0;
+
   size_t hits = atomic_load(&stats.tcache_hits);
   size_t misses = atomic_load(&stats.tcache_misses);
   size_t total = hits + misses;
@@ -397,6 +435,10 @@ void allocator_print_stats(void) {
   printf("live allocations:  %zu\n", allocs - frees);
   printf("mmap calls: %zu\n", atomic_load(&stats.mmap_calls));
   printf("munmap calls: %zu\n", atomic_load(&stats.munmap_calls));
+  printf("large cache hits: %zu\n", atomic_load(&stats.large_cache_hits));
+  printf("large cache wasted : %zu bytes (%.1f MB)\n",
+         atomic_load(&stats.large_cache_wasted_bytes),
+         atomic_load(&stats.large_cache_wasted_bytes) / 1e6);
   // live bytes is bugged causing size_t overflow
   //  printf("live bytes: %zu\n", atomic_load(&stats.live_bytes));
 }
