@@ -1,3 +1,10 @@
+# executables
+bench_cus
+bench_cus_dbg
+bench_libc
+test
+*.out
+*.exe
 # Prerequisites
 *.d
 
