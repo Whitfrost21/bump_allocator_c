@@ -10,7 +10,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define LARGE_CACHE_SIZE 8
+#define LARGE_CACHE_SIZE 32
 #define NUM_BINS 8
 #define ALIGN(size) (((size) + 7) & ~7)
 typedef struct block_header {
@@ -27,7 +27,7 @@ static block_header_t *bins[NUM_BINS];
 
 static block_header_t *large_cache_blocks[LARGE_CACHE_SIZE];
 static int large_cache_count = 0;
-#define TCACHE_MAX 64
+#define TCACHE_MAX 512
 typedef struct {
   block_header_t *bins[NUM_BINS];
   int count[NUM_BINS];
@@ -45,7 +45,7 @@ __thread size_t local_frees = 0;
 int bin_index(size_t size) {
   if (size <= 8)
     return 0;
-  int index = 31 - __builtin_clz(size - 1) - 2;
+  int index = 31 - __builtin_clz(size - 1) - 3;
   if (index >= NUM_BINS)
     return NUM_BINS - 1;
   return index;
@@ -289,7 +289,7 @@ void *mymalloc(size_t size) {
 
   if (block) {
     bin_remove(block); // remove block before splitting to avoid bin confusions
-    if (block->size >= size + sizeof(block_header_t) + 1) {
+    if (block->size >= size + sizeof(block_header_t) + 8) {
 
       splitblocks(block, size);
     }
@@ -378,7 +378,7 @@ void *myrealloc(void *blk, size_t size) {
   //
   block_header_t *block = (block_header_t *)blk - 1;
   size_t oldsize = block->size;
-  int wasmmapped = block->ismmapped; 
+  // int wasmmapped = block->ismmapped; 
   // skipping in place expansion cause i dont have any way to differentaite
   // between tcache blocks and global heap blocks if (block->next &&
   // block->next->isfree &&
