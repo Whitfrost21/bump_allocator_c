@@ -2,6 +2,7 @@
 bench_cus
 bench_cus_dbg
 bench_libc
+bench_prof
 test
 *.out
 *.exe

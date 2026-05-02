@@ -10,7 +10,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define LARGE_CACHE_SIZE 32
+#define LARGE_CACHE_SIZE 32 // no. of tcache blocks
 #define NUM_BINS 8
 #define ALIGN(size) (((size) + 7) & ~7)
 typedef struct block_header {
@@ -28,9 +28,17 @@ static block_header_t *bins[NUM_BINS];
 static block_header_t *large_cache_blocks[LARGE_CACHE_SIZE];
 static int large_cache_count = 0;
 #define TCACHE_MAX 512
+#define TCACHE_SLOTS 64
+
+static inline int tcache_index(size_t size) {
+  if (size < 8)
+    return -1;
+  return (size >> 3) - 1;
+}
+
 typedef struct {
-  block_header_t *bins[NUM_BINS];
-  int count[NUM_BINS];
+  block_header_t *slots[TCACHE_SLOTS];
+  int count[TCACHE_SLOTS];
 } tcache_t;
 __thread tcache_t tcache = {0};
 
@@ -204,7 +212,7 @@ void flush_tcache(int idx) {
   atomic_fetch_add(&stats.tcache_misses, local_misses);
   local_frees = local_misses = local_hits = local_allocs = 0;
   pthread_mutex_lock(&heaplock);
-  block_header_t *block = tcache.bins[idx];
+  block_header_t *block = tcache.slots[idx];
   while (block) {
     block_header_t *next = block->bin_next;
     block->bin_next = NULL;
@@ -212,7 +220,7 @@ void flush_tcache(int idx) {
     bin_insert(block);
     block = next;
   }
-  tcache.bins[idx] = NULL;
+  tcache.slots[idx] = NULL;
   tcache.count[idx] = 0;
   pthread_mutex_unlock(&heaplock);
 }
@@ -223,27 +231,14 @@ void *mymalloc(size_t size) {
   size = ALIGN(size);
 
   if (size < LARGE_ALLOC) {
-    int idx = bin_index(size);
-    if (tcache.bins[idx]) {
-      block_header_t *block = tcache.bins[idx];
-      while (block) {
-        if (block->size >= size) {
-          if (block->bin_next)
-            block->bin_next->bin_prev = block->bin_prev;
-          if (block->bin_prev)
-            block->bin_prev->bin_next = block->bin_next;
-          else
-            tcache.bins[idx] = block->bin_next;
-          tcache.count[idx]--;
-          block->isfree = 0;
-          block->bin_next = NULL;
-          block->bin_prev = NULL;
-          local_hits++;
-          local_allocs++;
-          return (void *)(block + 1);
-        }
-        block = block->bin_next;
-      }
+    int slot = tcache_index(size);
+    if (slot < TCACHE_SLOTS && tcache.slots[slot]) {
+      block_header_t *block = tcache.slots[slot];
+      tcache.slots[slot] = block->bin_next;
+      tcache.count[slot]--;
+      block->isfree = 0;
+      block->bin_next = NULL;
+      return (void *)(block + 1);
     }
   }
 
@@ -313,23 +308,24 @@ void myfree(void *ptr) {
   }
   block_header_t *block = (block_header_t *)ptr - 1;
   if (!block->ismmapped) {
-    int idx = bin_index(block->size);
-    if (tcache.count[idx] >= TCACHE_MAX) {
-      flush_tcache(idx);
+    int slot = tcache_index(block->size);
+    if (slot>=0 && slot < TCACHE_SLOTS) {
+      if (tcache.count[slot] >= TCACHE_MAX) {
+        flush_tcache(slot);
+      }
+      block->bin_next = tcache.slots[slot];
+      block->bin_prev=NULL;
+      tcache.slots[slot] = block;
+      tcache.count[slot]++;
+      // local_frees++;
+      return;
     }
-    block->isfree = 1;
-    block->bin_next = tcache.bins[idx];
-    block->bin_prev = NULL;
-    tcache.bins[idx] = block;
-    tcache.count[idx]++;
-    local_frees++;
-    return;
   }
   pthread_mutex_lock(&heaplock);
   if (block->ismmapped) {
     if (large_cache_count < LARGE_CACHE_SIZE) {
       large_cache_blocks[large_cache_count++] = block;
-      atomic_fetch_add(&stats.free_count, 1);
+      // atomic_fetch_add(&stats.free_count, 1);
     } else {
       munmap(block, sizeof(block_header_t) + block->size);
       atomic_fetch_add(&stats.munmap_calls, 1);
@@ -378,9 +374,10 @@ void *myrealloc(void *blk, size_t size) {
   //
   block_header_t *block = (block_header_t *)blk - 1;
   size_t oldsize = block->size;
-  // int wasmmapped = block->ismmapped; 
+  // int wasmmapped = block->ismmapped;
   // skipping in place expansion cause i dont have any way to differentaite
-  // between tcache blocks and global heap blocks if (block->next &&
+  // between tcache blocks and global heap blocks
+  // if (block->next &&
   // block->next->isfree &&
   //     (block->next->bin_prev != NULL ||
   //      bins[bin_index(block->next->size)] == block->next) &&
