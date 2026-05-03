@@ -28,7 +28,7 @@ static block_header_t *bins[NUM_BINS];
 static block_header_t *large_cache_blocks[LARGE_CACHE_SIZE];
 static int large_cache_count = 0;
 #define TCACHE_MAX 512
-#define TCACHE_SLOTS 64
+#define TCACHE_SLOTS 128
 
 static inline int tcache_index(size_t size) {
   if (size < 8)
@@ -205,6 +205,20 @@ block_header_t *find_free_block(size_t size) {
   return NULL;
 }
 
+static pthread_key_t stats_key;
+static pthread_once_t stats_key_once = PTHREAD_ONCE_INIT;
+static void flush_thread_stats(void *arg) {
+  (void)arg;
+  atomic_fetch_add(&stats.alloc_count, local_allocs);
+  atomic_fetch_add(&stats.free_count, local_frees);
+  atomic_fetch_add(&stats.tcache_hits, local_hits);
+  atomic_fetch_add(&stats.tcache_misses, local_misses);
+  local_hits = local_allocs = local_frees = local_misses = 0;
+}
+
+static void init_stats_key(void) {
+  pthread_key_create(&stats_key, flush_thread_stats);
+}
 void flush_tcache(int idx) {
   atomic_fetch_add(&stats.alloc_count, local_allocs);
   atomic_fetch_add(&stats.free_count, local_frees);
@@ -225,19 +239,30 @@ void flush_tcache(int idx) {
   pthread_mutex_unlock(&heaplock);
 }
 
+__thread int stats_registered = 0;
+
 void *mymalloc(size_t size) {
+  if (!stats_registered) {
+    pthread_once(&stats_key_once, init_stats_key);
+    pthread_setspecific(stats_key, (void *)1);
+    stats_registered = 1;
+  }
   if (size == 0)
     return NULL;
   size = ALIGN(size);
 
   if (size < LARGE_ALLOC) {
     int slot = tcache_index(size);
-    if (slot < TCACHE_SLOTS && tcache.slots[slot]) {
+    if (slot >= 0 && slot < TCACHE_SLOTS && tcache.slots[slot]) {
       block_header_t *block = tcache.slots[slot];
       tcache.slots[slot] = block->bin_next;
       tcache.count[slot]--;
       block->isfree = 0;
       block->bin_next = NULL;
+      // atomic_fetch_add(&stats.alloc_count, 1);
+      // atomic_fetch_add(&stats.tcache_hits, 1);
+      local_hits++;
+      local_allocs++;
       return (void *)(block + 1);
     }
   }
@@ -254,6 +279,8 @@ void *mymalloc(size_t size) {
         size_t wasted = block->size - size;
         atomic_fetch_add(&stats.large_cache_wasted_bytes, wasted);
         atomic_fetch_add(&stats.large_cache_hits, 1);
+        // atomic_fetch_add(&stats.tcache_hits, 1);
+        // atomic_fetch_add(&stats.alloc_count, 1);
         local_hits++;
         local_allocs++;
         return (void *)(block + 1);
@@ -273,10 +300,12 @@ void *mymalloc(size_t size) {
     block->bin_next = NULL;
     block->bin_prev = NULL;
     atomic_fetch_add(&stats.mmap_calls, 1);
+    // atomic_fetch_add(&stats.alloc_count, 1);
     local_allocs++;
     return (void *)(block + 1);
   }
 
+  // atomic_fetch_add(&stats.tcache_misses, 1);
   local_misses++;
   pthread_mutex_lock(&heaplock);
 
@@ -297,6 +326,7 @@ void *mymalloc(size_t size) {
       return NULL;
     }
   }
+  // atomic_fetch_add(&stats.alloc_count, 1);
   local_allocs++;
   pthread_mutex_unlock(&heaplock);
   return (void *)(block + 1);
@@ -309,15 +339,16 @@ void myfree(void *ptr) {
   block_header_t *block = (block_header_t *)ptr - 1;
   if (!block->ismmapped) {
     int slot = tcache_index(block->size);
-    if (slot>=0 && slot < TCACHE_SLOTS) {
+    if (slot >= 0 && slot < TCACHE_SLOTS) {
       if (tcache.count[slot] >= TCACHE_MAX) {
         flush_tcache(slot);
       }
       block->bin_next = tcache.slots[slot];
-      block->bin_prev=NULL;
+      block->bin_prev = NULL;
       tcache.slots[slot] = block;
       tcache.count[slot]++;
-      // local_frees++;
+      // atomic_fetch_add(&stats.free_count, 1);
+      local_frees++;
       return;
     }
   }
@@ -326,9 +357,11 @@ void myfree(void *ptr) {
     if (large_cache_count < LARGE_CACHE_SIZE) {
       large_cache_blocks[large_cache_count++] = block;
       // atomic_fetch_add(&stats.free_count, 1);
+      local_frees++;
     } else {
       munmap(block, sizeof(block_header_t) + block->size);
       atomic_fetch_add(&stats.munmap_calls, 1);
+      // atomic_fetch_add(&stats.free_count, 1);
       local_frees++;
     }
     pthread_mutex_unlock(&heaplock);
@@ -337,6 +370,7 @@ void myfree(void *ptr) {
   block->isfree = 1;
   bin_insert(block);
   coalesce(block);
+  // atomic_fetch_add(&stats.free_count, 1);
   local_frees++;
   pthread_mutex_unlock(&heaplock);
 }

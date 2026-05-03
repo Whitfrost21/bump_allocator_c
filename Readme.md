@@ -15,8 +15,8 @@ A from-scratch implementation of `malloc`, `free`, `calloc`, and `realloc` in C,
 | 8-byte alignment | All allocations aligned via `ALIGN(size)` macro |
 | mmap chunk allocator | Heap grows in 2MB chunks via `mmap` instead of `sbrk` |
 | Large allocation path | Allocations ≥ 128KB get dedicated `mmap` regions |
-| Large block cache | Up to 8 large `mmap` blocks cached on free to avoid syscall overhead |
-| Per-thread cache (tcache) | Each thread holds up to 64 free blocks per bin, zero-lock fast path |
+| Large block cache | Up to 32 large `mmap` blocks cached on free to avoid syscall overhead |
+| Per-thread cache (tcache) | Each thread holds up to 128 free blocks per bin, zero-lock fast path |
 | Thread safety | Global `heaplock` mutex protects all shared heap state |
 | Allocator statistics | Tracks tcache hit rate, mmap calls, fragmentation, live allocations |
 
@@ -56,7 +56,7 @@ myfree(ptr)
     │
     ├─ heap block ──► push to per-thread tcache
     │                    │
-    │                count ≥ 64 ─► flush_tcache() ─► global bins + coalesce
+    │                count ≥ 128 ─► flush_tcache() ─► global bins + coalesce
     │
     └─ mmap block ──► push to large_cache[] or munmap() if large cache is full
 ```
@@ -107,7 +107,7 @@ typedef struct {
 __thread tcache_t tcache = {0};
 ```
 
-Hot path (tcache hit) requires zero locks. Cache flushes to global bins when any bin reaches `TCACHE_MAX = 64` blocks.
+Hot path (tcache hit) requires zero locks. Cache flushes to global bins when any bin reaches `TCACHE_MAX = 128` blocks.
 
 ---
 
@@ -116,6 +116,8 @@ Hot path (tcache hit) requires zero locks. Cache flushes to global bins when any
 ```bash
 # compile allocator + tests
 gcc -pthread -fsanitize=thread allocator.c tests.c -o test
+#or just
+make 
 
 # run correctness tests
 ./test
@@ -136,20 +138,20 @@ gcc -pthread -O2            benchmark.c               -o bench_libc
 Tested on x86-64 Linux, 8 threads, `-O2`.
 
 ```
-                        custom      libc      notes
-single alloc+free:      ~80ms       ~27ms     3x slower
-batch alloc (10k):      ~1.5ms      ~3.8ms    YOU WIN 2.5x
-batch free  (10k):      ~0.5ms      ~1.0ms    YOU WIN 2x
-mixed sizes (100k):     ~9ms        ~2.5ms    4x slower (was 86ms before large cache)
-realloc chain (100k):   ~3ms        ~2.6ms    roughly tied
-multithreaded (8T):     ~800ms      ~67ms     12x slower (heaplock contention)
+                    cutom       libc      verdict
+single alloc+free:  58ms        29ms      2x slower
+batch alloc:        1.44ms      3.59ms    2.5x faster
+batch free:         0.36ms      1.54ms    4x faster
+mixed sizes:        6.46ms      2.95ms    2x slower
+realloc chain:      6.42ms      2.56ms    2.5x slower
+multithreaded:      64ms        67ms      tie(barely faster)
 ```
 
-tcache hit rate: **~73%** on typical workloads.
+tcache hit rate: **~99%** on typical workloads.
 
 ### Key observations
 
-- **Batch alloc/free** — tcache dominates, beats libc because blocks stay thread-local
+- **Batch alloc/free** — tcache wins here, beats libc because blocks stay thread-local
 - **Mixed sizes** — large block cache reduced mmap syscalls from 10,000 to ~1, 10x improvement
 - **Multithreaded** — single global `heaplock` is the bottleneck; per-thread arenas would close this gap
 - **Single alloc+free** — libc wins due to ptmalloc per-arena design
@@ -162,16 +164,16 @@ Call `allocator_print_stats()` after workload to see:
 
 ```
 ===allocator stats===
-tcache hits:        3,800,000
-tcache misses:      1,400,000
-tcache hit rate:    73.1%
-total allocs:       5,200,001
-total frees:        5,200,001
-live allocations:   0
-mmap calls:         1
-munmap calls:       0
-large cache hits:   9,999
-large cache wasted: 0 bytes (0.0 MB)
+tcache hits: 5197038
+tcache misses: 12962
+tcache hit rate : 99.8%
+total allocs:      5210001
+total frees:       5210001
+live allocations:  0
+mmap calls: 1
+munmap calls: 0
+large cache hits: 9999
+large cache wasted : 0 bytes (0.0 MB)
 ```
 
 ---
