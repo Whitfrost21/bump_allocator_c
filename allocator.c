@@ -17,6 +17,7 @@ typedef struct block_header {
   size_t size;
   int isfree;
   int ismmapped;
+  int in_tcache;
   struct block_header *next;
   struct block_header *prev;
   struct block_header *bin_next;
@@ -229,6 +230,7 @@ void flush_tcache(int idx) {
   block_header_t *block = tcache.slots[idx];
   while (block) {
     block_header_t *next = block->bin_next;
+    block->in_tcache = 0;
     block->bin_next = NULL;
     block->bin_prev = NULL;
     bin_insert(block);
@@ -258,6 +260,7 @@ void *mymalloc(size_t size) {
       tcache.slots[slot] = block->bin_next;
       tcache.count[slot]--;
       block->isfree = 0;
+      block->in_tcache = 0;
       block->bin_next = NULL;
       // atomic_fetch_add(&stats.alloc_count, 1);
       // atomic_fetch_add(&stats.tcache_hits, 1);
@@ -343,6 +346,7 @@ void myfree(void *ptr) {
       if (tcache.count[slot] >= TCACHE_MAX) {
         flush_tcache(slot);
       }
+      block->in_tcache = 1;
       block->bin_next = tcache.slots[slot];
       block->bin_prev = NULL;
       tcache.slots[slot] = block;
@@ -392,51 +396,37 @@ void *myrealloc(void *blk, size_t size) {
     myfree(blk);
     return NULL;
   }
-  // pthread_mutex_lock(&heaplock);
-  // block_header_t *block = (block_header_t *)blk - 1;
-  // if (block->ismmapped) {
-  //   size_t oldsize = block->size;
-  //   pthread_mutex_unlock(&heaplock);
-  //   void *newblock = mymalloc(size);
-  //   if (!newblock)
-  //     return NULL;
-  //   size_t tocopy = oldsize < size ? oldsize : size;
-  //   memcpy(newblock, blk, tocopy);
-  //   myfree(blk);
-  //   return newblock;
-  // }
-  //
   block_header_t *block = (block_header_t *)blk - 1;
+  /*
+   * in_tache is a way to differentiate between tcached blocks and global list
+   * blocks
+   */
+
   size_t oldsize = block->size;
-  // int wasmmapped = block->ismmapped;
-  // skipping in place expansion cause i dont have any way to differentaite
-  // between tcache blocks and global heap blocks
-  // if (block->next &&
-  // block->next->isfree &&
-  //     (block->next->bin_prev != NULL ||
-  //      bins[bin_index(block->next->size)] == block->next) &&
-  //     (char *)(block + 1) + block->size == (char *)block->next &&
-  //     block->size + sizeof(block_header_t) + block->next->size >= size)
-  // {
-  //   if ((char *)(block + 1) + block->size == (char *)block->next &&
-  //       block->next->isfree &&
-  //       block->size + sizeof(block_header_t) + block->next->size >= size) {
-  //     bin_remove(block->next);
-  //     if (block->next == lastblock)
-  //       lastblock = block;
-  //     block->size = block->size + sizeof(block_header_t) + block->next->size;
-  //     block->next = block->next->next;
-  //     if (block->next)
-  //       block->next->prev = block;
-  //     if (block->size > size + sizeof(block_header_t) + 8) {
-  //       splitblocks(block, size);
-  //     }
-  //     pthread_mutex_unlock(&heaplock);
-  //     return (void *)(block + 1);
-  //   }
-  // }
-  // size_t oldsize = block->size;
-  // pthread_mutex_unlock(&heaplock);
+  pthread_mutex_lock(&heaplock);
+  if (block->next && block->next->isfree && !block->next->in_tcache &&
+      (block->next->bin_prev != NULL ||
+       bins[bin_index(block->next->size)] == block->next) &&
+      (char *)(block + 1) + block->size == (char *)block->next &&
+      block->size + sizeof(block_header_t) + block->next->size >= size) {
+    if ((char *)(block + 1) + block->size == (char *)block->next &&
+        block->next->isfree &&
+        block->size + sizeof(block_header_t) + block->next->size >= size) {
+      bin_remove(block->next);
+      if (block->next == lastblock)
+        lastblock = block;
+      block->size = block->size + sizeof(block_header_t) + block->next->size;
+      block->next = block->next->next;
+      if (block->next)
+        block->next->prev = block;
+      if (block->size > size + sizeof(block_header_t) + 8) {
+        splitblocks(block, size);
+      }
+      pthread_mutex_unlock(&heaplock);
+      return (void *)(block + 1);
+    }
+  }
+  pthread_mutex_unlock(&heaplock);
   void *newblock = mymalloc(size);
   if (!newblock)
     return NULL;
